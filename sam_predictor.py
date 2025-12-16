@@ -1,7 +1,7 @@
-import os
 import cv2
 import numpy as np
 import onnxruntime
+import threading
 from rdp import rdp
 
 class LRUCache:
@@ -93,34 +93,37 @@ class SAMPredictor:
         self.current_image_shape = None
         self.current_filename = None
         self.epsilon = 1.5  # For RDP
+        self.lock = threading.Lock()
 
     def set_image(self, image: np.ndarray, filename: str):
-        if filename == self.current_filename:
-            return
+        with self.lock:
+            if filename == self.current_filename:
+                return
 
-        self.current_filename = filename
-        cached_embedding = self.image_embedding_cache.get(filename)
-        if cached_embedding:
-            self.current_image_embedding, self.current_image_shape = cached_embedding
-        else:
-            self.current_image_embedding, self.current_image_shape = self.model.encode(image)
-            self.image_embedding_cache.put(filename, (self.current_image_embedding, self.current_image_shape))
+            self.current_filename = filename
+            cached_embedding = self.image_embedding_cache.get(filename)
+            if cached_embedding:
+                self.current_image_embedding, self.current_image_shape = cached_embedding
+            else:
+                self.current_image_embedding, self.current_image_shape = self.model.encode(image)
+                self.image_embedding_cache.put(filename, (self.current_image_embedding, self.current_image_shape))
 
     def predict(self, points: np.ndarray, labels: np.ndarray):
-        if self.current_image_embedding is None:
-            return []
+        with self.lock:
+            if self.current_image_embedding is None:
+                return []
 
-        # The ONNX model uses the 'orig_im_size' parameter to resize the mask internally.
-        # The output 'masks' should already be at the full, original image resolution.
-        masks = self.model.predict_masks(self.current_image_embedding, self.current_image_shape, points, labels)
-        
-        # We take the first mask, assuming it's the most likely one.
-        mask = masks[0, 0, :, :]
-        
-        # Post-process the full-resolution mask to get polygons. No more scaling is needed.
-        polygons = self.post_process(mask)
+            # The ONNX model uses the 'orig_im_size' parameter to resize the mask internally.
+            # The output 'masks' should already be at the full, original image resolution.
+            masks = self.model.predict_masks(self.current_image_embedding, self.current_image_shape, points, labels)
+            
+            # We take the first mask, assuming it's the most likely one.
+            mask = masks[0, 0, :, :]
+            
+            # Post-process the full-resolution mask to get polygons. No more scaling is needed.
+            polygons = self.post_process(mask)
 
-        return polygons
+            return polygons
 
     def post_process(self, mask: np.ndarray):
         # This method now expects a full-resolution mask.

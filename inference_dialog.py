@@ -18,6 +18,8 @@ class InferenceDialog(QDialog):
         self.model_layout = QFormLayout(self.model_group)
         self.model_path_edit = QLineEdit()
         self.model_path_edit.setReadOnly(True)
+        self.model_path_edit.setPlaceholderText("Select a model file...")
+        self.model_path_edit.textChanged.connect(self.validate_inputs)
         self.browse_button = QPushButton("Browse...")
         self.browse_button.clicked.connect(self.browse_model)
         self.model_layout.addRow("Model Path:", self.browse_button)
@@ -46,7 +48,9 @@ class InferenceDialog(QDialog):
             item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
             item.setCheckState(Qt.Unchecked)
             self.list_widget.addItem(item)
-            
+        
+        self.list_widget.itemChanged.connect(self.validate_inputs)
+
         self.select_all_checkbox = QCheckBox("Select All")
         self.select_all_checkbox.stateChanged.connect(self.toggle_select_all)
         
@@ -58,10 +62,22 @@ class InferenceDialog(QDialog):
         self.button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
+        self.button_box.button(QDialogButtonBox.Ok).setEnabled(False) # Default disabled
         self.layout.addWidget(self.button_box)
 
+    def validate_inputs(self):
+        model_valid = bool(self.model_path_edit.text().strip())
+        
+        images_valid = False
+        for i in range(self.list_widget.count()):
+            if self.list_widget.item(i).checkState() == Qt.Checked:
+                images_valid = True
+                break
+        
+        self.button_box.button(QDialogButtonBox.Ok).setEnabled(model_valid and images_valid)
+
     def browse_model(self):
-        file_path, _ = QFileDialog.getOpenFileName(self, "Select Model for Inference", "", "PyTorch Models (*.pt)")
+        file_path, _ = QFileDialog.getOpenFileName(self, "Select Model for Inference", "", "PyTorch Models (*.pt);;All Files (*)")
         if file_path:
             self.model_path_edit.setText(file_path)
 

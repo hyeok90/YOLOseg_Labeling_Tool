@@ -1,8 +1,9 @@
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QFormLayout, QLineEdit, QDialogButtonBox, 
     QFileDialog, QPushButton, QGroupBox, QSpinBox, QDoubleSpinBox, 
-    QGridLayout, QLabel, QHBoxLayout, QComboBox, QCheckBox
+    QGridLayout, QLabel, QComboBox, QHBoxLayout
 )
+from yaml_creator_dialog import YamlCreatorDialog
 
 class TrainingDialog(QDialog):
     def __init__(self, parent=None):
@@ -16,9 +17,19 @@ class TrainingDialog(QDialog):
         self.data_group = QGroupBox("Data")
         self.data_layout = QFormLayout(self.data_group)
         self.yaml_path_edit = QLineEdit()
+        self.yaml_path_edit.setPlaceholderText("Select a dataset YAML file...")
+        self.yaml_path_edit.textChanged.connect(self.validate_inputs)
+        
+        # YAML Buttons layout
+        self.yaml_buttons_layout = QHBoxLayout()
         self.browse_button = QPushButton("Browse...")
         self.browse_button.clicked.connect(self.browse_yaml)
-        self.data_layout.addRow("Dataset YAML:", self.browse_button)
+        self.create_yaml_button = QPushButton("Create New...")
+        self.create_yaml_button.clicked.connect(self.create_new_yaml)
+        self.yaml_buttons_layout.addWidget(self.browse_button)
+        self.yaml_buttons_layout.addWidget(self.create_yaml_button)
+        
+        self.data_layout.addRow("Dataset YAML:", self.yaml_buttons_layout)
         self.data_layout.addRow("", self.yaml_path_edit)
         self.layout.addWidget(self.data_group)
 
@@ -160,12 +171,24 @@ class TrainingDialog(QDialog):
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         self.button_box.button(QDialogButtonBox.Ok).setText("Start Training")
+        self.button_box.button(QDialogButtonBox.Ok).setEnabled(False) # Default disabled
         self.layout.addWidget(self.button_box)
+
+    def validate_inputs(self):
+        is_valid = bool(self.yaml_path_edit.text().strip())
+        self.button_box.button(QDialogButtonBox.Ok).setEnabled(is_valid)
 
     def browse_yaml(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select Dataset YAML File", "", "YAML Files (*.yaml *.yml)")
         if file_path:
             self.yaml_path_edit.setText(file_path)
+
+    def create_new_yaml(self):
+        dialog = YamlCreatorDialog(self)
+        if dialog.exec_() == QDialog.Accepted:
+            created_path = dialog.get_created_file_path()
+            if created_path:
+                self.yaml_path_edit.setText(created_path)
 
     def get_parameters(self):
         return {

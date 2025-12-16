@@ -80,16 +80,7 @@ class Shape:
         self.selected = False
         self.shape_type = shape_type
         self.flags = flags
-        self.other_data = {}
         self.attributes = attributes
-        self.cache_label = None
-        self.cache_description = None
-        self.visible = True
-
-        # Rotation setting
-        self.direction = direction
-        self.center = None
-        self.show_degrees = True
 
         self._highlight_index = None
         self._highlight_mode = self.NEAR_VERTEX
@@ -315,7 +306,7 @@ class Shape:
         min_distance = float("inf")
         min_i = None
         for i, p in enumerate(self.points):
-            dist = utils.distance(p - point)
+            dist = utils.distance(p, point)
             if dist <= epsilon and dist < min_distance:
                 min_distance = dist
                 min_i = i

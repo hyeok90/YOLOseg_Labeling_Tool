@@ -1,12 +1,16 @@
 import math
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QPointF
 from PyQt5.QtWidgets import QMessageBox
 
 from shape import Shape
 import utils
 from sam_thread import SAMPredictionThread
+from config import Config
+
+from shapely.geometry import Point, Polygon, MultiPolygon, LineString
+from shapely.ops import unary_union
 
 CURSOR_DEFAULT = QtCore.Qt.ArrowCursor
 CURSOR_POINT = QtCore.Qt.PointingHandCursor
@@ -17,8 +21,13 @@ CURSOR_GRAB = QtCore.Qt.OpenHandCursor
 class ImageViewer(QtWidgets.QWidget):
     polygon_selected = QtCore.pyqtSignal(object)
     new_polygon_drawn = QtCore.pyqtSignal(object)
+    shapes_updated = QtCore.pyqtSignal()
 
-    CREATE, EDIT = 0, 1
+    # Modes
+    EDIT = 0
+    CREATE_POLY = 1
+    CREATE_BRUSH = 2
+    CREATE_ERASER = 3
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -27,7 +36,7 @@ class ImageViewer(QtWidgets.QWidget):
         self.shapes = []
         self.shapes_backups = []
         self.num_backups = 10
-        self.current = None
+        self.current = None # Used for polygon drawing
         self.selected_shapes = []
         self.line = Shape()
         self.prev_point = QtCore.QPoint()
@@ -37,7 +46,8 @@ class ImageViewer(QtWidgets.QWidget):
         self._cursor = CURSOR_DEFAULT
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.WheelFocus)
-        self.epsilon = 11.0
+        self.epsilon = 11.0 # Tolerance for mouse hover / vertex selection
+        self.simplify_epsilon = Config.DEFAULT_EPSILON # Tolerance for RDP simplification
 
         self.h_shape = None
         self.h_vertex = None
@@ -46,6 +56,14 @@ class ImageViewer(QtWidgets.QWidget):
         self.is_panning = False
         self.pan_start_pos = QtCore.QPoint()
         self.offset = QtCore.QPointF()
+
+        # Brush / Eraser attributes
+        self.brush_radius = Config.DEFAULT_BRUSH_RADIUS
+        self.brush_path_points = [] # Temporary storage for brush trajectory
+        self.is_brushing = False
+        self.brush_layer = None
+        self.brush_painter = None
+        self.last_brush_pos = None
 
         # SAM-related attributes
         self.sam_points = []
@@ -64,30 +82,30 @@ class ImageViewer(QtWidgets.QWidget):
 
     @property
     def is_shape_restorable(self):
-        return len(self.shapes_backups) > 1
+        return len(self.shapes_backups) > 0
 
     def restore_shape(self):
         if not self.is_shape_restorable:
             return
-        self.shapes_backups.pop()
         shapes_backup = self.shapes_backups.pop()
         self.shapes = shapes_backup
         self.selected_shapes = []
         for shape in self.shapes:
             shape.selected = False
         self.update()
+        self.shapes_updated.emit()
 
-    def set_editing(self, value=True):
-        self.mode = self.EDIT if value else self.CREATE
-        if not value:
+    def set_mode(self, mode):
+        self.mode = mode
+        if mode == self.EDIT:
             self.un_highlight()
             self.deselect_shape()
-
-    def drawing(self):
-        return self.mode == self.CREATE
-
-    def editing(self):
-        return self.mode == self.EDIT
+        elif mode in [self.CREATE_BRUSH, self.CREATE_ERASER]:
+            # Do NOT deselect when entering brush/eraser mode
+            pass
+        else:
+            self.deselect_shape() # Usually deselect when starting other tools
+        self.update()
 
     def set_image(self, pixmap):
         self.pixmap = pixmap
@@ -150,9 +168,31 @@ class ImageViewer(QtWidgets.QWidget):
         for shape in self.shapes:
             shape.paint(p)
 
-        if self.current:
+        if self.mode == self.CREATE_POLY and self.current:
             self.current.paint(p)
             self.line.paint(p)
+
+        # Draw Brush/Eraser Trajectory (Visual feedback)
+        if self.is_brushing and self.brush_layer:
+            # The brush layer is in scene coordinates (same size as pixmap)
+            # but we are already transformed (scaled/translated) so we draw it at 0,0
+            p.drawPixmap(0, 0, self.brush_layer)
+
+        # Draw Brush/Eraser Cursor
+        if self.mode in [self.CREATE_BRUSH, self.CREATE_ERASER]:
+            cursor_pos = self.mapFromGlobal(QtGui.QCursor.pos())
+            # Map back to scene coords just for logic, but here we need to draw relative to scene transforms
+            # Actually, it's easier to draw the cursor in screen space, but we are inside the transformed painter.
+            # So we draw the cursor at the transformed mouse position.
+            
+            # Since we can't easily get the mouse position inside paintEvent without tracking it,
+            # we rely on mouseMoveEvent to trigger updates. 
+            # Ideally, we track the last mouse scene position.
+            if hasattr(self, 'last_mouse_pos'):
+                p.setPen(QtGui.QPen(Qt.white, 2 / self.scale, Qt.DashLine))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(self.last_mouse_pos, self.brush_radius, self.brush_radius)
+
 
         # Draw SAM points
         p.setRenderHint(QtGui.QPainter.Antialiasing)
@@ -183,16 +223,45 @@ class ImageViewer(QtWidgets.QWidget):
 
     def mousePressEvent(self, ev: QtGui.QMouseEvent):
         pos = self.transform_pos(ev.pos())
+        self.last_mouse_pos = pos
 
+        # SAM Mode
         if self.parent.is_sam_mode and ev.button() == Qt.LeftButton:
             if self.parent.sam_point_mode is not None:
                 self.add_sam_point(pos, self.parent.sam_point_mode)
-            return # Always consume left clicks in SAM mode
+            return
+
+        # Panning
+        if ev.button() == Qt.MidButton:
+            self.is_panning = True
+            self.pan_start_pos = ev.pos()
+            return
 
         if ev.button() == Qt.LeftButton:
-            if self.drawing():
-                self.handle_drawing(pos)
-            else:
+            if self.mode == self.CREATE_POLY:
+                self.handle_poly_drawing(pos)
+            
+            elif self.mode in [self.CREATE_BRUSH, self.CREATE_ERASER]:
+                self.is_brushing = True
+                self.brush_path_points = [pos]
+                self.last_brush_pos = pos
+                
+                # Initialize temporary layer for smooth rendering
+                if not self.pixmap.isNull():
+                    self.brush_layer = QtGui.QPixmap(self.pixmap.size())
+                    self.brush_layer.fill(Qt.transparent)
+                    
+                    self.brush_painter = QtGui.QPainter(self.brush_layer)
+                    self.brush_painter.setRenderHint(QtGui.QPainter.Antialiasing)
+                    
+                    color = QtGui.QColor(0, 255, 0, 100) if self.mode == self.CREATE_BRUSH else QtGui.QColor(255, 0, 0, 100)
+                    self.brush_painter.setPen(Qt.NoPen)
+                    self.brush_painter.setBrush(color)
+                    self.brush_painter.drawEllipse(pos, self.brush_radius, self.brush_radius)
+
+                self.update()
+
+            elif self.mode == self.EDIT:
                 if self.h_vertex is not None:
                     self.select_shape(self.h_shape)
                 else:
@@ -202,15 +271,12 @@ class ImageViewer(QtWidgets.QWidget):
                 self.moving_shape = True
 
         elif ev.button() == Qt.RightButton:
-            if self.drawing() and self.current:
-                self.finalise()
-
-        elif ev.button() == Qt.MidButton:
-            self.is_panning = True
-            self.pan_start_pos = ev.pos()
+            if self.mode == self.CREATE_POLY and self.current:
+                self.finalise_poly()
 
     def mouseMoveEvent(self, ev: QtGui.QMouseEvent):
         pos = self.transform_pos(ev.pos())
+        self.last_mouse_pos = pos
 
         if self.is_panning:
             delta = ev.pos() - self.pan_start_pos
@@ -219,14 +285,31 @@ class ImageViewer(QtWidgets.QWidget):
             self.update()
             return
 
-        if self.drawing() and self.current and not self.parent.is_sam_mode:
+        if self.mode == self.CREATE_POLY and self.current and not self.parent.is_sam_mode:
             if self.close_enough(pos, self.current.points[0]):
                 pos = self.current.points[0]
             self.line.points = [self.current.points[-1], pos]
             self.update()
             return
 
-        if self.editing():
+        if self.mode in [self.CREATE_BRUSH, self.CREATE_ERASER]:
+            if self.is_brushing:
+                self.brush_path_points.append(pos)
+                
+                if self.brush_painter and self.last_brush_pos:
+                    # Draw a line of circles to fill gaps
+                    color = QtGui.QColor(0, 255, 0, 100) if self.mode == self.CREATE_BRUSH else QtGui.QColor(255, 0, 0, 100)
+                    pen = QtGui.QPen(color, self.brush_radius * 2)
+                    pen.setCapStyle(Qt.RoundCap)
+                    self.brush_painter.setPen(pen)
+                    self.brush_painter.drawLine(self.last_brush_pos, pos)
+                    
+                self.last_brush_pos = pos
+                
+            self.update() # To redraw cursor and layer
+            return
+
+        if self.mode == self.EDIT:
             if self.h_vertex is not None and (ev.buttons() & Qt.LeftButton):
                 self.h_shape.move_vertex_by(self.h_vertex, pos - self.prev_point)
                 self.prev_point = pos
@@ -241,53 +324,185 @@ class ImageViewer(QtWidgets.QWidget):
                 self.update()
                 return
 
-        # Hover logic
-        self.un_highlight()
-        
-        # --- Optimization: Filter shapes by bounding box ---
-        candidate_shapes = [s for s in reversed(self.shapes) if s.bounding_rect().contains(pos)]
-        
-        # Find nearest vertex in candidate shapes
-        for shape in candidate_shapes:
-            index = shape.nearest_vertex(pos, self.epsilon / self.scale)
-            if index is not None:
-                self.h_shape = shape
-                self.h_vertex = index
-                shape.highlight_vertex(index, Shape.MOVE_VERTEX)
-                self.update()
-                break
-        else: # if no vertex found, check for shape containment in candidates
+            # Hover logic
+            self.un_highlight()
+            candidate_shapes = [s for s in reversed(self.shapes) if s.bounding_rect().contains(pos)]
             for shape in candidate_shapes:
-                if shape.contains_point(pos):
+                index = shape.nearest_vertex(pos, self.epsilon / self.scale)
+                if index is not None:
                     self.h_shape = shape
+                    self.h_vertex = index
+                    shape.highlight_vertex(index, Shape.MOVE_VERTEX)
                     self.update()
                     break
+            else:
+                for shape in candidate_shapes:
+                    if shape.contains_point(pos):
+                        self.h_shape = shape
+                        self.update()
+                        break
 
     def mouseReleaseEvent(self, ev: QtGui.QMouseEvent):
         if ev.button() == Qt.MidButton:
             self.is_panning = False
         
-        if ev.button() == Qt.LeftButton and self.moving_shape:
-            self.store_shapes()
-            self.moving_shape = False
+        if ev.button() == Qt.LeftButton:
+            if self.mode == self.EDIT and self.moving_shape:
+                self.store_shapes()
+                self.moving_shape = False
+            
+            elif self.mode in [self.CREATE_BRUSH, self.CREATE_ERASER] and self.is_brushing:
+                self.finish_brush_stroke()
 
-    def handle_drawing(self, pos):
+    def handle_poly_drawing(self, pos):
         if self.current is None:
             self.current = Shape(shape_type='polygon')
             self.current.add_point(pos)
             self.line.points = [pos, pos]
         else:
             if len(self.current.points) > 1 and self.close_enough(pos, self.current.points[0]):
-                self.finalise()
+                self.finalise_poly()
             else:
                 self.current.add_point(pos)
 
-    def finalise(self):
+    def finalise_poly(self):
         if self.current:
             self.current.close()
             self.new_polygon_drawn.emit(self.current)
             self.current = None
             self.update()
+
+    def finish_brush_stroke(self):
+        self.is_brushing = False
+        
+        # Cleanup painter
+        if self.brush_painter:
+            self.brush_painter.end()
+            self.brush_painter = None
+        
+        self.brush_layer = None # Release memory
+        
+        if not self.brush_path_points:
+            return
+
+        self.store_shapes()
+        
+        # 1. Create a unified polygon from the brush stroke
+        # Instead of unioning many circles (which creates bumps), we buffer the path as a single line
+        if len(self.brush_path_points) < 2:
+             # Fallback for single point click
+             unified_stroke = Point(self.brush_path_points[0].x(), self.brush_path_points[0].y()).buffer(self.brush_radius)
+        else:
+             path_coords = [(p.x(), p.y()) for p in self.brush_path_points]
+             # Buffer the line string to create a thick stroke
+             unified_stroke = LineString(path_coords).buffer(self.brush_radius, cap_style=1, join_style=1)
+        
+        # Simplify slightly to reduce vertex count
+        unified_stroke = unified_stroke.simplify(self.simplify_epsilon, preserve_topology=True)
+
+        if self.mode == self.CREATE_BRUSH:
+            # If selection exists, merge. Else, create new.
+            target_shape = None
+            if len(self.selected_shapes) == 1:
+                target_shape = self.selected_shapes[0]
+            
+            if target_shape:
+                # Merge with existing selected shape
+                original_poly = self.shape_to_shapely(target_shape)
+                merged_poly = unary_union([original_poly, unified_stroke])
+                self.update_shape_from_shapely(target_shape, merged_poly)
+            else:
+                # Create NEW shape from the stroke (No selection -> New Instance)
+                new_shape = self.shapely_to_shape(unified_stroke)
+                if new_shape:
+                    self.new_polygon_drawn.emit(new_shape)
+        
+        elif self.mode == self.CREATE_ERASER:
+            # If selection exists, erase from it. If NO selection, do NOT erase anything.
+            if not self.selected_shapes:
+                return # Protect other instances
+
+            targets = self.selected_shapes
+            
+            shapes_to_remove = []
+            
+            for shape in targets:
+                original_poly = self.shape_to_shapely(shape)
+                if original_poly.is_empty or not original_poly.is_valid:
+                    continue
+                    
+                diff_poly = original_poly.difference(unified_stroke)
+                
+                if diff_poly.is_empty:
+                    shapes_to_remove.append(shape)
+                else:
+                    if isinstance(diff_poly, MultiPolygon):
+                        # Keep the largest part for the original object
+                        parts = list(diff_poly.geoms)
+                        parts.sort(key=lambda p: p.area, reverse=True)
+                        
+                        self.update_shape_from_shapely(shape, parts[0])
+                        
+                        # Discard smaller parts (parts[1:]) per user request
+                    else:
+                        self.update_shape_from_shapely(shape, diff_poly)
+
+            for s in shapes_to_remove:
+                if s in self.shapes:
+                    self.shapes.remove(s)
+                # Ensure the shape is also removed from selection, so next brush stroke creates a NEW instance
+                if s in self.selected_shapes:
+                    self.selected_shapes.remove(s)
+            
+            # If selection became empty, trigger deselection event
+            if not self.selected_shapes:
+                self.deselect_shape()
+
+        self.brush_path_points = []
+        self.update()
+        self.shapes_updated.emit()
+
+    def shape_to_shapely(self, shape):
+        # Convert QPointF list to [(x,y)]
+        coords = [(p.x(), p.y()) for p in shape.points]
+        if len(coords) < 3:
+            return Polygon()
+        return Polygon(coords)
+
+    def shapely_to_shape(self, poly):
+        if poly.is_empty:
+            return None
+        
+        # Handle just Polygon for now. MultiPolygon handled in caller.
+        if isinstance(poly, MultiPolygon):
+             # Just return largest for safety, though caller should handle
+             return self.shapely_to_shape(max(poly.geoms, key=lambda p: p.area))
+
+        xs, ys = poly.exterior.coords.xy
+        points = [QPointF(x, y) for x, y in zip(xs, ys)]
+        
+        # Remove last point if duplicate (Shapely closes loop)
+        if len(points) > 0 and points[0] == points[-1]:
+            points.pop()
+            
+        s = Shape(shape_type='polygon')
+        s.points = points
+        s.close()
+        return s
+
+    def update_shape_from_shapely(self, shape, poly):
+        # Update existing shape object with new geometry
+        # Simplify result to avoid excessive points
+        poly = poly.simplify(self.simplify_epsilon, preserve_topology=True)
+        
+        if isinstance(poly, MultiPolygon):
+             poly = max(poly.geoms, key=lambda p: p.area)
+             
+        xs, ys = poly.exterior.coords.xy
+        points = [QPointF(x, y) for x, y in zip(xs, ys)]
+        if len(points) > 0 and points[0] == points[-1]:
+            points.pop()
+        shape.points = points
 
     def delete_selected_vertex(self):
         if self.h_shape is None or self.h_vertex is None:
@@ -298,35 +513,29 @@ class ImageViewer(QtWidgets.QWidget):
 
         shape.remove_point(vertex_index)
 
-        # If a polygon becomes too small, remove it completely
         if shape.shape_type == 'polygon' and len(shape.points) < 3:
             self.shapes.remove(shape)
-            self.deselect_shape() # In case it was selected
+            self.deselect_shape()
 
         self.un_highlight()
         self.store_shapes()
         self.update()
+        self.shapes_updated.emit()
         return True
-
 
     def cancel_drawing(self):
         self.current = None
         self.line.points = []
         self.clear_sam_points()
-        self.repaint()
-
-    def undo_last_point(self):
-        if not self.current or not self.current.points:
-            return
+        self.brush_path_points = []
+        self.is_brushing = False
         
-        self.current.pop_point()
-        if self.current.points:
-            self.line.points = [self.current.points[-1], self.current.points[-1]]
-        else:
-            self.line.points = []
-            self.current = None
-
-        self.repaint()
+        if self.brush_painter:
+            self.brush_painter.end()
+            self.brush_painter = None
+        self.brush_layer = None
+        
+        self.update()
 
     def transform_pos(self, point):
         return (point - self.offset) / self.scale
@@ -345,11 +554,8 @@ class ImageViewer(QtWidgets.QWidget):
         self.h_vertex = None
         self.update()
 
-    def set_draw_mode(self, enabled):
-        self.set_editing(not enabled)
-
     def close_enough(self, p1, p2):
-        return utils.distance(p1 - p2) < (self.epsilon / self.scale)
+        return utils.distance(p1, p2) < (self.epsilon / self.scale)
 
     # --- SAM Methods ---
 
@@ -413,6 +619,4 @@ class ImageViewer(QtWidgets.QWidget):
         for shape in new_shapes:
             shape.fill = False
             shape.line_color = QtGui.QColor(0, 255, 0, 128) # Default color
-        
-        # The viewer state is now cleared from the main window after the user confirms the class.
         return new_shapes

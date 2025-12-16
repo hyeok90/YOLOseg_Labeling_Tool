@@ -6,7 +6,7 @@ import numpy as np
 from PyQt5 import QtGui
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QAction, QFileDialog, 
-    QListWidget, QMessageBox, QDockWidget, QListWidgetItem, QInputDialog, QLabel, QMenu, QDialog, QDialogButtonBox, QProgressDialog, QSlider
+    QListWidget, QMessageBox, QDockWidget, QListWidgetItem, QInputDialog, QLabel, QMenu, QDialog, QProgressDialog, QSlider, QActionGroup
 )
 from PyQt5.QtGui import QPixmap, QIcon, QColor, QImage
 from PyQt5.QtCore import Qt, QPointF
@@ -22,13 +22,15 @@ from inference_dialog import InferenceDialog
 from class_manager_dialog import ClassManagerDialog
 from class_selector_dialog import ClassSelectorDialog
 from class_specification_dialog import ClassSpecificationDialog
+from config import Config
+from label_manager import LabelManager
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         
-        self.setWindowTitle("YOLOv11-seg Active Learning Tool")
-        self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle(Config.APP_NAME)
+        self.setGeometry(100, 100, Config.WINDOW_WIDTH, Config.WINDOW_HEIGHT)
         
         self.model = None
         self.model_path = None
@@ -37,11 +39,10 @@ class MainWindow(QMainWindow):
         self.current_image_rgb = None
         self.class_names = []
         self.color_map = []
-        self.epsilon = 1.0 # Default RDP epsilon
+        self.epsilon = Config.DEFAULT_EPSILON
 
-        # Directory for temporary labels, created within the project folder
-        self.temp_dir = os.path.join(os.getcwd(), ".temp_labels")
-        self.source_label_dir = None
+        # Initialize Label Manager
+        self.label_manager = LabelManager(Config.get_temp_dir())
 
         # SAM Predictor
         self.sam_predictor = None
@@ -49,15 +50,14 @@ class MainWindow(QMainWindow):
         self.sam_point_mode = None # 1 for positive, 0 for negative
         self.encoder_thread = None
         self.is_encoding = False
-        encoder_path = "sam/sam_encoder.onnx"
-        decoder_path = "sam/sam_decoder.onnx"
-        if os.path.exists(encoder_path) and os.path.exists(decoder_path):
+        
+        if os.path.exists(Config.SAM_ENCODER_PATH) and os.path.exists(Config.SAM_DECODER_PATH):
             try:
-                self.sam_predictor = SAMPredictor(encoder_path, decoder_path)
+                self.sam_predictor = SAMPredictor(Config.SAM_ENCODER_PATH, Config.SAM_DECODER_PATH)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load SAM model: {e}")
         else:
-            print("SAM models (sam_encoder.onnx, sam_decoder.onnx) not found. SAM mode will be disabled.")
+            print(f"SAM models ({Config.SAM_ENCODER_PATH}, {Config.SAM_DECODER_PATH}) not found. SAM mode will be disabled.")
 
 
         self.viewer = ImageViewer(self)
@@ -74,6 +74,7 @@ class MainWindow(QMainWindow):
 
         self.viewer.polygon_selected.connect(self.on_polygon_selected)
         self.viewer.new_polygon_drawn.connect(self.on_new_polygon_drawn)
+        self.viewer.shapes_updated.connect(self.populate_instance_list)
 
     def create_actions(self):
         self.open_folder_action = QAction(QIcon.fromTheme("folder-open"), "&Open Image Folder", self)
@@ -109,7 +110,18 @@ class MainWindow(QMainWindow):
         self.draw_sam_action.toggled.connect(self.toggle_sam_mode)
         if not self.sam_predictor:
             self.draw_sam_action.setEnabled(False)
+
+        self.paint_mode_action = QAction(QIcon.fromTheme("draw-brush"), "Paint Tool (B)", self)
+        self.paint_mode_action.setCheckable(True)
+        self.paint_mode_action.toggled.connect(self.toggle_paint_mode)
         
+        # Action Group for exclusive selection
+        self.mode_group = QActionGroup(self)
+        self.mode_group.addAction(self.draw_poly_action)
+        self.mode_group.addAction(self.draw_sam_action)
+        self.mode_group.addAction(self.paint_mode_action)
+        self.mode_group.setExclusive(False) # We manage exclusivity manually to allow "no mode" (Esc)
+
         self.fit_window_action = QAction(QIcon.fromTheme("zoom-fit-best"), "Fit to Window", self)
         self.fit_window_action.triggered.connect(self.viewer.fit_to_window)
 
@@ -160,14 +172,16 @@ class MainWindow(QMainWindow):
         tool_bar = self.addToolBar("Main ToolBar")
         tool_bar.addAction(self.draw_poly_action)
         tool_bar.addAction(self.draw_sam_action)
+        tool_bar.addAction(self.paint_mode_action)
         tool_bar.addSeparator()
         tool_bar.addAction(self.fit_window_action)
         
         tool_bar.addSeparator()
         
         # Epsilon Slider for RDP simplification
-        self.epsilon_label = QLabel(" Simplify: 1.0 ")
-        tool_bar.addWidget(self.epsilon_label)
+        self.epsilon_label = QLabel(" Epsilon: 1.0 ")
+        self.epsilon_label_action = tool_bar.addWidget(self.epsilon_label)
+        self.epsilon_label_action.setVisible(False) # Hide by default
         
         self.epsilon_slider = QSlider(Qt.Horizontal)
         self.epsilon_slider.setMinimum(0)
@@ -175,13 +189,36 @@ class MainWindow(QMainWindow):
         self.epsilon_slider.setValue(10) # Default 1.0
         self.epsilon_slider.setFixedWidth(100)
         self.epsilon_slider.valueChanged.connect(self.update_epsilon)
-        tool_bar.addWidget(self.epsilon_slider)
+        self.epsilon_slider_action = tool_bar.addWidget(self.epsilon_slider)
+        self.epsilon_slider_action.setVisible(False) # Hide by default
+
+        tool_bar.addSeparator()
+
+        # Brush Radius Slider
+        self.radius_label = QLabel(f" Brush Size: {Config.DEFAULT_BRUSH_RADIUS} ")
+        self.radius_label_action = tool_bar.addWidget(self.radius_label)
+        self.radius_label_action.setVisible(False)
+
+        self.radius_slider = QSlider(Qt.Horizontal)
+        self.radius_slider.setMinimum(1)
+        self.radius_slider.setMaximum(Config.DEFAULT_BRUSH_MAX)
+        self.radius_slider.setValue(Config.DEFAULT_BRUSH_RADIUS)
+        self.radius_slider.setFixedWidth(100)
+        self.radius_slider.valueChanged.connect(self.update_brush_radius)
+        self.radius_slider_action = tool_bar.addWidget(self.radius_slider)
+        self.radius_slider_action.setVisible(False)
 
     def update_epsilon(self, value):
         self.epsilon = value / 10.0
-        self.epsilon_label.setText(f" Simplify: {self.epsilon:.1f} ")
+        self.viewer.simplify_epsilon = self.epsilon
+        self.epsilon_label.setText(f" Epsilon: {self.epsilon:.1f} ")
         if self.sam_predictor:
             self.sam_predictor.epsilon = self.epsilon
+
+    def update_brush_radius(self, value):
+        self.viewer.brush_radius = value
+        self.radius_label.setText(f" Brush Size: {value} ")
+        self.viewer.update()
 
     def create_docks(self):
         file_list_dock = QDockWidget("File List", self)
@@ -228,6 +265,7 @@ class MainWindow(QMainWindow):
         self.undo_action.setEnabled(enabled)
         self.manage_classes_action.setEnabled(enabled)
         self.class_specification_action.setEnabled(enabled)
+        self.paint_mode_action.setEnabled(enabled)
 
     def open_folder(self):
         folder_path = QFileDialog.getExistingDirectory(self, "Open Image Folder")
@@ -242,8 +280,11 @@ class MainWindow(QMainWindow):
             self.file_list_widget.clear()
             
             image_files = sorted([f for f in os.listdir(folder_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+            
+            # Setup labels directory (implicit source)
             labels_dir = os.path.join(os.path.dirname(folder_path), "labels")
             os.makedirs(labels_dir, exist_ok=True)
+            self.label_manager.set_source_label_dir(labels_dir)
             
             for img_file in image_files:
                 img_path = os.path.join(folder_path, img_file)
@@ -346,11 +387,10 @@ class MainWindow(QMainWindow):
                 shape.close()
                 shapes_to_save.append(shape)
             
-            labels_dir = os.path.join(self.temp_dir, "labels")
-            os.makedirs(labels_dir, exist_ok=True)
-            txt_path = os.path.join(labels_dir, os.path.splitext(os.path.basename(image_path))[0] + ".txt")
-
-            save_yolo_labels(txt_path, shapes_to_save, img_w, img_h, class_names)
+            # Use label manager to save
+            self.label_manager.set_class_names(self.class_names)
+            self.label_manager.save_labels(image_path, shapes_to_save, img_dims)
+            
         except Exception as e:
             print(f"Failed to run inference on {os.path.basename(image_path)}: {e}")
 
@@ -368,15 +408,29 @@ class MainWindow(QMainWindow):
             self.training_thread.start()
             
             self.train_action.setEnabled(False)
+            self.run_inference_action.setEnabled(False)
+            self.class_specification_action.setEnabled(False)
+            if self.sam_predictor:
+                self.draw_sam_action.setEnabled(False)
+            
             self.statusBar().showMessage("Training started... Logs will be shown in the console.")
 
     def on_training_failed(self, error_msg):
         QMessageBox.critical(self, "Training Failed", error_msg)
         self.statusBar().showMessage("Training failed.", 5000)
         self.train_action.setEnabled(True)
+        self.run_inference_action.setEnabled(True)
+        self.class_specification_action.setEnabled(True)
+        if self.sam_predictor:
+            self.draw_sam_action.setEnabled(True)
 
     def on_training_finished(self, results):
         self.train_action.setEnabled(True)
+        self.run_inference_action.setEnabled(True)
+        self.class_specification_action.setEnabled(True)
+        if self.sam_predictor:
+            self.draw_sam_action.setEnabled(True)
+
         try:
             best_model_path = os.path.join(results.save_dir, 'weights', 'best.pt')
             if os.path.exists(best_model_path):
@@ -478,6 +532,7 @@ class MainWindow(QMainWindow):
             with open(class_file, 'r') as f:
                 class_names = [line.strip() for line in f if line.strip()]
             self.class_names = class_names
+            self.label_manager.set_class_names(self.class_names)
             self.rebuild_color_map_and_refresh_ui()
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to read class file: {e}")
@@ -485,30 +540,19 @@ class MainWindow(QMainWindow):
 
         # 2. Select label directory
         label_dir = QFileDialog.getExistingDirectory(self, "Select Folder Containing Label Files")
-        if not label_dir:
-            self.source_label_dir = None
-        else:
-            self.source_label_dir = label_dir
+        self.label_manager.set_source_label_dir(label_dir if label_dir else None)
 
         # 3. Clear all existing temporary labels to force a full reload
-        temp_labels_path = os.path.join(self.temp_dir, "labels")
-        if os.path.exists(temp_labels_path):
-            progress_dialog = QProgressDialog("Clearing old temporary labels...", "Cancel", 0, len(self.image_paths), self)
-            progress_dialog.setWindowModality(Qt.WindowModal)
-            progress_dialog.setWindowTitle("Uploading Labels")
-
-            for i, (img_path, _) in enumerate(self.image_paths):
-                progress_dialog.setValue(i)
-                QApplication.processEvents()
-                if progress_dialog.wasCanceled():
-                    break
-
-                txt_file = os.path.splitext(os.path.basename(img_path))[0] + ".txt"
-                temp_label_path_file = os.path.join(temp_labels_path, txt_file)
-                if os.path.exists(temp_label_path_file):
-                    os.remove(temp_label_path_file)
-            
-            progress_dialog.setValue(len(self.image_paths))
+        progress_dialog = QProgressDialog("Clearing old temporary labels...", "Cancel", 0, 0, self)
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setWindowTitle("Uploading Labels")
+        progress_dialog.show()
+        QApplication.processEvents()
+        
+        self.label_manager.clear_temp_labels()
+        
+        progress_dialog.setValue(1)
+        progress_dialog.close()
 
         # 4. Reload labels for the current image from the new source.
         self.load_labels_for_current_image()
@@ -529,28 +573,10 @@ class MainWindow(QMainWindow):
             self.viewer.update()
             return
 
-        img_path, (img_w, img_h) = self.image_paths[self.current_image_index]
-        txt_file = os.path.splitext(os.path.basename(img_path))[0] + ".txt"
-
-        temp_label_path = os.path.join(self.temp_dir, "labels", txt_file)
+        img_path, dims = self.image_paths[self.current_image_index]
+        self.label_manager.set_class_names(self.class_names) # Ensure manager has latest classes
         
-        source_label_path = None
-        if self.source_label_dir:
-            source_label_path = os.path.join(self.source_label_dir, txt_file)
-
-        label_path_to_load = None
-        # Default behavior: prioritize temporary (edited) labels over source labels.
-        if os.path.exists(temp_label_path):
-            label_path_to_load = temp_label_path
-        elif source_label_path and os.path.exists(source_label_path):
-            label_path_to_load = source_label_path
-        
-        shapes = []
-        if label_path_to_load:
-            try:
-                shapes = load_yolo_labels(label_path_to_load, img_w, img_h, self.class_names)
-            except Exception as e:
-                print(f"Error loading label file {label_path_to_load}: {e}")
+        shapes = self.label_manager.load_labels(img_path, dims)
 
         self.viewer.shapes = shapes
         self.viewer.store_shapes()
@@ -686,20 +712,29 @@ class MainWindow(QMainWindow):
             self.load_image_by_index(self.current_image_index + 1)
 
     def toggle_draw_mode(self, checked):
-        self.viewer.set_draw_mode(checked)
-        self.set_navigation_enabled(not checked) # Disable navigation when drawing
         if checked:
-            # If SAM mode is on, turn it off.
-            if self.draw_sam_action.isChecked():
-                self.draw_sam_action.setChecked(False)
-                self.toggle_sam_mode(False) # This will handle cleanup
+            # Ensure others are unchecked (manual exclusivity for better control)
+            if self.draw_sam_action.isChecked(): self.draw_sam_action.setChecked(False)
+            if self.paint_mode_action.isChecked(): self.paint_mode_action.setChecked(False)
+
+            self.viewer.set_mode(ImageViewer.CREATE_POLY)
+            self.set_navigation_enabled(False)
+        else:
+            if not (self.draw_sam_action.isChecked() or self.paint_mode_action.isChecked()):
+                self.viewer.set_mode(ImageViewer.EDIT)
+                self.set_navigation_enabled(True)
 
     def toggle_sam_mode(self, checked):
-        self.set_navigation_enabled(not checked) # Disable navigation when SAM is active or preparing
         if checked:
+            # Ensure others are unchecked
+            if self.draw_poly_action.isChecked(): self.draw_poly_action.setChecked(False)
+            if self.paint_mode_action.isChecked(): self.paint_mode_action.setChecked(False)
+
+            self.set_navigation_enabled(False)
+
             if self.is_encoding or self.current_image_index < 0:
                 self.draw_sam_action.setChecked(False)
-                self.set_navigation_enabled(True) # Re-enable if we bail out
+                self.set_navigation_enabled(True)
                 return
 
             current_img_path = self.image_paths[self.current_image_index][0]
@@ -722,24 +757,73 @@ class MainWindow(QMainWindow):
                     self.on_sam_encoding_failed("Encoding cancelled or failed.")
                     return
             else:
-                # Already encoded, just enable the mode
                 self.on_sam_encoding_finished()
         else:
+            # Hide Epsilon controls first
+            self.epsilon_label_action.setVisible(False)
+            self.epsilon_slider_action.setVisible(False)
+            
             self.is_sam_mode = False
             self.sam_point_mode = None
-            self.viewer.set_editing(True)
-            self.viewer.clear_sam_points()
-            self.statusBar().showMessage("Ready", 2000)
+            if not (self.draw_poly_action.isChecked() or self.paint_mode_action.isChecked()):
+                self.viewer.set_mode(ImageViewer.EDIT)
+                self.viewer.clear_sam_points()
+                self.set_navigation_enabled(True)
+                self.statusBar().showMessage("Ready", 2000)
+
+    def toggle_paint_mode(self, checked):
+        if checked:
+            # Ensure others are unchecked (manual exclusivity for safety)
+            if self.draw_poly_action.isChecked(): self.draw_poly_action.setChecked(False)
+            if self.draw_sam_action.isChecked(): self.draw_sam_action.setChecked(False)
+            
+            # Safety check: Must have an image loaded
+            if not self.image_paths or self.current_image_index < 0:
+                self.paint_mode_action.setChecked(False)
+                return
+
+            # Check if we are editing an existing shape or creating a new one
+            mode_msg = "New Instance"
+            if self.viewer.selected_shapes:
+                mode_msg = "Editing Selected"
+            
+            self.viewer.set_mode(ImageViewer.CREATE_BRUSH)
+            self.set_navigation_enabled(False)
+            self.statusBar().showMessage(f"Paint Mode: Brush ({mode_msg}). Press 'E' for Eraser, 'Q' for Brush.")
+            
+            # Show Brush controls LAST to ensure layout updates correctly
+            self.radius_label_action.setVisible(True)
+            self.radius_slider_action.setVisible(True)
+            self.epsilon_label_action.setVisible(True)
+            self.epsilon_slider_action.setVisible(True)
+            
+        else:
+            # Hide Brush controls FIRST
+            self.radius_label_action.setVisible(False)
+            self.radius_slider_action.setVisible(False)
+            self.epsilon_label_action.setVisible(False)
+            self.epsilon_slider_action.setVisible(False)
+
+            if not (self.draw_poly_action.isChecked() or self.draw_sam_action.isChecked()):
+                self.viewer.set_mode(ImageViewer.EDIT)
+                self.set_navigation_enabled(True)
+                self.statusBar().showMessage("Ready")
 
     def on_sam_encoding_finished(self):
         self.is_encoding = False
         self.draw_sam_action.setEnabled(True)
+        
+        # Show Epsilon controls now that SAM is ready
+        self.epsilon_label_action.setVisible(True)
+        self.epsilon_slider_action.setVisible(True)
+        
         print("SAM processing complete.")
         self.statusBar().showMessage("SAM processing complete. Press 'Q' for positive points, 'E' for negative.", 5000)
 
         # Proceed to enable SAM mode
         self.is_sam_mode = True
-        self.viewer.set_editing(False)
+        self.viewer.set_mode(ImageViewer.EDIT) # SAM is overlay, base mode is EDIT but clicks handled specially
+        # Actually in SAM mode we handle clicks specifically in mousePressEvent of viewer
         if self.draw_poly_action.isChecked():
             self.draw_poly_action.setChecked(False)
 
@@ -752,50 +836,48 @@ class MainWindow(QMainWindow):
         QMessageBox.critical(self, "SAM Encoding Error", f"Failed to prepare SAM model:\n{error_msg}")
 
     def on_new_polygon_drawn(self, shape):
-        self.draw_poly_action.setChecked(False)
-        self.toggle_draw_mode(False)
+        # Only toggle off if it was poly mode
+        if self.viewer.mode == ImageViewer.CREATE_POLY:
+            self.draw_poly_action.setChecked(False)
+            self.toggle_draw_mode(False)
+        
         self.viewer.store_shapes()
 
         dialog = ClassSelectorDialog(self.class_names, self)
         if dialog.exec_() == QDialog.Accepted:
             class_name = dialog.get_selected_class()
             
-            if not class_name: # Should not happen if dialog is accepted, but as a safeguard
+            if not class_name:
                 self.viewer.restore_shape()
                 self.viewer.update()
                 return
 
-            # Check if it's a new class
             if class_name not in self.class_names:
                 self.class_names.append(class_name)
                 self.rebuild_color_map_and_refresh_ui()
 
-            # Assign the class and add the shape
             shape.label = class_name
             shape.score = 1.0
             self.viewer.shapes.append(shape)
             self.populate_instance_list()
+            
+            # Select the newly created shape to allow immediate editing (e.g., painting/erasing)
+            self.viewer.select_shape(shape)
+            
             self.viewer.update()
-            self.viewer.store_shapes() # Store the final state with the new shape
+            self.viewer.store_shapes()
         else:
-            # User cancelled, so remove the shape
             self.viewer.restore_shape()
             self.viewer.update()
-        
+
     def save_current_labels(self):
         if self.current_image_index == -1:
             return
 
-        img_path, (img_w, img_h) = self.image_paths[self.current_image_index]
+        img_path, dims = self.image_paths[self.current_image_index]
+        self.label_manager.set_class_names(self.class_names)
+        self.label_manager.save_labels(img_path, self.viewer.shapes, dims)
         
-        txt_file = os.path.splitext(os.path.basename(img_path))[0] + ".txt"
-        
-        # Save to a temporary directory instead of the source
-        labels_dir = os.path.join(self.temp_dir, "labels")
-        os.makedirs(labels_dir, exist_ok=True)
-        txt_path = os.path.join(labels_dir, txt_file)
-
-        save_yolo_labels(txt_path, self.viewer.shapes, img_w, img_h, self.class_names)
         self.statusBar().showMessage(f"Saved labels for {os.path.basename(img_path)} to temp.", 2000)
 
     def export_files(self):
@@ -831,16 +913,18 @@ class MainWindow(QMainWindow):
         progress_dialog = QProgressDialog("Exporting files...", "Cancel", 0, len(self.image_paths), self)
         progress_dialog.setWindowModality(Qt.WindowModal)
         progress_dialog.setWindowTitle("Exporting")
+        
+        # Ensure manager has latest classes
+        self.label_manager.set_class_names(self.class_names)
 
         exported_labels_count = 0
-        for i, (source_img_path, (img_w, img_h)) in enumerate(self.image_paths):
+        for i, (source_img_path, dims) in enumerate(self.image_paths):
             progress_dialog.setValue(i)
             QApplication.processEvents()
             if progress_dialog.wasCanceled():
                 break
 
             img_filename = os.path.basename(source_img_path)
-            txt_filename = os.path.splitext(img_filename)[0] + ".txt"
 
             # a. Copy image file
             try:
@@ -849,33 +933,22 @@ class MainWindow(QMainWindow):
                 print(f"Failed to copy image {img_filename}: {e}")
                 continue # Skip to next image
 
-            # b. Find the correct label file to use (temp > source)
-            temp_label_path = os.path.join(self.temp_dir, "labels", txt_filename)
-            source_label_path = os.path.join(self.source_label_dir, txt_filename) if self.source_label_dir else None
+            # b. Export labels via Manager
+            # We want to export only ONE file here effectively per loop, 
+            # but manager.export_labels handles a list. We can use it or call load/save directly.
+            # Efficient way: Let manager handle loading, filtering, saving for single item.
+            # But manager export is batch. Let's make a mini-batch or just use load/save logic.
+            # Actually, manager has export_labels which iterates. We can just call it for the whole list
+            # OUTSIDE the loop if we want to be efficient, but we are also copying images here.
+            # Let's keep the loop structure for image copying + progress, but helper for labels.
             
-            label_path_to_process = None
-            if os.path.exists(temp_label_path):
-                label_path_to_process = temp_label_path
-            elif source_label_path and os.path.exists(source_label_path):
-                label_path_to_process = source_label_path
-
-            # c. If a label exists, filter and write it
-            if label_path_to_process:
-                try:
-                    # Read shapes using the application's current full class list
-                    all_shapes = load_yolo_labels(label_path_to_process, img_w, img_h, self.class_names)
-                    
-                    # Filter shapes based on the valid_export_classes list
-                    shapes_to_export = [s for s in all_shapes if s.label in valid_export_classes]
-
-                    if shapes_to_export:
-                        dest_txt_path = os.path.join(dest_labels_dir, txt_filename)
-                        # Write the filtered shapes, mapping class names to the new filtered index
-                        save_yolo_labels(dest_txt_path, shapes_to_export, img_w, img_h, valid_export_classes)
-                        exported_labels_count += 1
-
-                except Exception as e:
-                    print(f"Failed to process or write label for {img_filename}: {e}")
+            shapes = self.label_manager.load_labels(source_img_path, dims)
+            shapes_to_export = [s for s in shapes if s.label in valid_export_classes]
+            
+            if shapes_to_export:
+                dest_txt_path = os.path.join(dest_labels_dir, os.path.splitext(img_filename)[0] + ".txt")
+                save_yolo_labels(dest_txt_path, shapes_to_export, dims[0], dims[1], valid_export_classes)
+                exported_labels_count += 1
 
         progress_dialog.setValue(len(self.image_paths))
         QMessageBox.information(self, "Export Complete", 
@@ -945,25 +1018,24 @@ class MainWindow(QMainWindow):
 
     def perform_specification_on_image(self, image_path, img_w, img_h, target_classes, refinement_model, refinement_model_classes):
         applied_labels = set()
-        txt_filename = os.path.splitext(os.path.basename(image_path))[0] + ".txt"
-        temp_label_path = os.path.join(self.temp_dir, "labels", txt_filename)
-        source_label_path = os.path.join(self.source_label_dir, txt_filename) if self.source_label_dir else None
         
-        label_path_to_process = None
-        if os.path.exists(temp_label_path):
-            label_path_to_process = temp_label_path
-        elif source_label_path and os.path.exists(source_label_path):
-            label_path_to_process = source_label_path
-
-        if not label_path_to_process:
-            return applied_labels
+        # Load directly via manager logic (without setting explicit source dir change, utilizing current state)
+        # Note: We need 'label_path_to_process' which is internal to manager usually.
+        # But we can just use manager.load_labels() which encapsulates that logic.
+        
+        # However, this method does explicit manual loading because it needs to read shapes, filter, and modify.
+        # Ideally, we load shapes -> modify -> save.
+        
+        # Check if we have labels to process first
+        # load_labels returns [] if empty or error.
+        all_shapes = self.label_manager.load_labels(image_path, (img_w, img_h))
+        if not all_shapes:
+             return applied_labels
 
         try:
             original_image = cv2.imread(image_path)
-            all_shapes = load_yolo_labels(label_path_to_process, img_w, img_h, self.class_names)
             
             final_shapes = []
-            # padding = 20  <-- Removed fixed padding
 
             for shape in all_shapes:
                 if shape.label not in target_classes:
@@ -989,7 +1061,7 @@ class MainWindow(QMainWindow):
                     final_shapes.append(shape)
                     continue
 
-                temp_crop_path = os.path.join(self.temp_dir, "crop.jpg")
+                temp_crop_path = os.path.join(self.label_manager.temp_dir, "crop.jpg")
                 cv2.imwrite(temp_crop_path, cropped_image)
 
                 # Use lower confidence (0.15) for refinement to capture subtle detections
@@ -1009,9 +1081,7 @@ class MainWindow(QMainWindow):
                 final_shapes.append(shape)
                 applied_labels.add(new_label)
 
-            temp_labels_dir = os.path.join(self.temp_dir, "labels")
-            os.makedirs(temp_labels_dir, exist_ok=True)
-            save_yolo_labels(temp_label_path, final_shapes, img_w, img_h, self.class_names)
+            self.label_manager.save_labels(image_path, final_shapes, (img_w, img_h))
 
         except Exception as e:
             print(f"Failed during specification for {os.path.basename(image_path)}: {e}")
@@ -1032,18 +1102,27 @@ class MainWindow(QMainWindow):
             self.cancel_all_modes()
             event.accept()
             return
-
-        # --- Drawing Mode Shortcuts ---
-        if self.draw_poly_action.isChecked():
-            if key == Qt.Key_Backspace:
-                self.viewer.undo_last_point()
-            # Block other conflicting shortcuts
-            elif key in [Qt.Key_A, Qt.Key_D, Qt.Key_S]:
-                self.statusBar().showMessage("Finish or cancel drawing before changing images or modes.", 2000)
-            elif key == Qt.Key_W:
-                 self.draw_poly_action.setChecked(False) # Toggle off
+        
+        if key == Qt.Key_Space:
+            self.fit_window_action.trigger()
             event.accept()
             return
+        
+        # --- Brush Radius Shortcuts ---
+        if key == Qt.Key_BracketLeft: # '['
+            val = self.radius_slider.value()
+            self.radius_slider.setValue(val - 5)
+        elif key == Qt.Key_BracketRight: # ']'
+            val = self.radius_slider.value()
+            self.radius_slider.setValue(val + 5)
+
+        # --- Epsilon Shortcuts ---
+        elif key == Qt.Key_Comma: # ','
+            val = self.epsilon_slider.value()
+            self.epsilon_slider.setValue(val - 1)
+        elif key == Qt.Key_Period: # '.'
+            val = self.epsilon_slider.value()
+            self.epsilon_slider.setValue(val + 1)
 
         # --- SAM Mode Shortcuts ---
         if self.is_sam_mode:
@@ -1089,10 +1168,35 @@ class MainWindow(QMainWindow):
             elif key == Qt.Key_S:
                 self.draw_sam_action.setChecked(False) # Toggle off
             # Block other conflicting shortcuts
-            elif key in [Qt.Key_A, Qt.Key_D, Qt.Key_W]:
+            elif key in [Qt.Key_A, Qt.Key_D, Qt.Key_W, Qt.Key_B]:
                  self.statusBar().showMessage("Finish or cancel SAM mode before changing images or modes.", 2000)
             event.accept()
             return
+
+        # --- Paint Mode Shortcuts ---
+        if key == Qt.Key_B:
+            # Explicitly switch to Paint mode (cancels others)
+            if self.image_paths and self.current_image_index >= 0:
+                self.paint_mode_action.setChecked(True)
+            event.accept()
+            return
+        
+        if self.paint_mode_action.isChecked():
+            if key == Qt.Key_Q:
+                self.viewer.set_mode(ImageViewer.CREATE_BRUSH)
+                self.statusBar().showMessage("Switched to Brush.", 1000)
+                event.accept()
+                return
+            elif key == Qt.Key_E:
+                self.viewer.set_mode(ImageViewer.CREATE_ERASER)
+                self.statusBar().showMessage("Switched to Eraser.", 1000)
+                event.accept()
+                return
+            # Block navigation keys A/D while painting
+            if key == Qt.Key_A or key == Qt.Key_D:
+                 self.statusBar().showMessage("Finish painting before changing images.", 2000)
+                 event.accept()
+                 return
 
         # --- Normal / Edit Mode Shortcuts ---
         if modifiers == Qt.ControlModifier and key == Qt.Key_S:
@@ -1102,10 +1206,12 @@ class MainWindow(QMainWindow):
             self.undo_action.trigger()
 
         elif key == Qt.Key_A:
-            self.prev_image_action.trigger()
+            if not self.paint_mode_action.isChecked():
+                self.prev_image_action.trigger()
 
         elif key == Qt.Key_D:
-            self.next_image_action.trigger()
+            if not self.paint_mode_action.isChecked():
+                self.next_image_action.trigger()
         
         elif key == Qt.Key_W:
             self.draw_poly_action.setChecked(True)
@@ -1137,13 +1243,18 @@ class MainWindow(QMainWindow):
         if self.draw_sam_action.isChecked():
             self.draw_sam_action.setChecked(False)
             self.toggle_sam_mode(False)
+            
+        if self.paint_mode_action.isChecked():
+            self.paint_mode_action.setChecked(False)
+            self.toggle_paint_mode(False)
         
         self.sam_point_mode = None
         # Clear any unfinished drawings in the viewer
         self.viewer.cancel_drawing()
         
         # Ensure viewer is in edit mode
-        self.viewer.set_editing(True)
+        self.viewer.set_mode(ImageViewer.EDIT)
+        self.set_navigation_enabled(True)
         
         self.statusBar().showMessage("Drawing cancelled", 2000)
 
@@ -1201,15 +1312,13 @@ class MainWindow(QMainWindow):
 
         if reply == QMessageBox.Yes:
             img_path, _ = self.image_paths[index]
-            txt_file = os.path.splitext(os.path.basename(img_path))[0] + ".txt"
-            labels_dir = os.path.join(os.path.dirname(os.path.dirname(img_path)), "labels")
-            txt_path = os.path.join(labels_dir, txt_file)
 
             try:
+                # Use manager to delete labels (temp and source)
+                self.label_manager.delete_label(img_path)
+                
                 if os.path.exists(img_path):
                     os.remove(img_path)
-                if os.path.exists(txt_path):
-                    os.remove(txt_path)
                 
                 # Remove from data structure and UI
                 del self.image_paths[index]
@@ -1240,9 +1349,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         """Clean up temporary files on exit."""
         try:
-            if os.path.exists(self.temp_dir):
-                shutil.rmtree(self.temp_dir)
-                print(f"Cleared temporary directory: {self.temp_dir}")
+            self.label_manager.clear_temp_labels()
+            print(f"Cleared temporary directory: {self.label_manager.temp_dir}")
         except Exception as e:
             print(f"Error cleaning up temporary directory: {e}")
         finally:

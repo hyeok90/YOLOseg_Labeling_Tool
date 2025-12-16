@@ -13,8 +13,6 @@ class ClassSpecificationDialog(QDialog):
         self.setMinimumSize(500, 600)
 
         self.image_paths = [path for path, _ in image_paths]
-        self.selected_class = None
-        self.model_path = None
 
         # --- Layout ---
         layout = QVBoxLayout(self)

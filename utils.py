@@ -2,9 +2,11 @@ import os
 import math
 from PyQt5.QtCore import QPointF
 
-def distance(p):
+def distance(p1, p2):
     """Distance between two points"""
-    return math.sqrt(p.x() * p.x() + p.y() * p.y())
+    dx = p1.x() - p2.x()
+    dy = p1.y() - p2.y()
+    return math.sqrt(dx * dx + dy * dy)
 
 def load_yolo_labels(txt_path, img_w, img_h, class_names):
     from shape import Shape
