@@ -8,6 +8,7 @@ This is a GUI-based image annotation tool developed with Python and PyQt5, desig
 - **🖋️ Smart Polygon Annotation:** 
     - **Polygon Tool:** Create, edit, and delete polygon-shaped annotations.
     - **Paint Brush Tool:** Draw masks naturally with a smooth brush. Supports RDP algorithm for automatic curve simplification.
+    - **SAM (Segment Anything Model):** Interactively segment objects using positive/negative points.
 - **🤖 YOLOv11 Model Integration:** Easily loads custom-trained YOLOv11-seg `.pt` models for inference and fine-tuning.
 - **🚀 Model Fine-Tuning & Dataset Management:** 
     - **YAML Creator:** Create dataset YAML files directly within the app by selecting train/val folders.
@@ -84,21 +85,37 @@ We recommend using [uv](https://github.com/astral-sh/uv) for fast package manage
 2.  **Workflow:**
     - **1. Load Model:** Run inference or train directly.
     - **2. Open Image Folder:** Load your dataset images.
-    - **3. Annotate:** Use Polygon (W) or Paint (B) tools.
+    - **3. Annotate:** Use Polygon (W), Paint (B), or SAM (S) tools.
     - **4. Train:** Create a YAML config, set params, and fine-tune your model.
     - **5. Export:** Save your dataset.
 
 ## ⌨️ Shortcuts
 
+### Global / Navigation
 | Key | Action |
 | :--- | :--- |
 | `A` / `D` | Previous / Next Image |
 | `W` | Toggle Polygon Draw Mode |
 | `B` | Toggle Paint Mode |
-| `[` / `]` | Decrease / Increase Brush Size |
-| `,` / `.` | Decrease / Increase Brush Smoothness (Epsilon) |
+| `S` | Toggle SAM Mode |
 | `Ctrl+S` | Save Current Labels |
 | `Ctrl+Z` | Undo Last Shape Modification |
 | `Delete` | Delete Selected Instance(s) |
 | `Mouse Wheel` | Zoom In / Out |
 | `Middle Drag` | Pan Image |
+
+### Paint Mode (B)
+| Key | Action |
+| :--- | :--- |
+| `Q` | Switch to Brush |
+| `E` | Switch to Eraser |
+| `[` / `]` | Decrease / Increase Brush Size |
+| `,` / `.` | Decrease / Increase Brush Smoothness (Epsilon) |
+
+### SAM Mode (S)
+| Key | Action |
+| :--- | :--- |
+| `Q` | Add Positive Point |
+| `E` | Add Negative Point |
+| `G` | Clear All SAM Points |
+| `F` | Finalize & Add Shape |
