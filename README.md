@@ -63,10 +63,9 @@ We recommend using [uv](https://github.com/astral-sh/uv) for fast and reliable p
     curl -LsSf https://astral.sh/uv/install.sh | sh
     ```
 
-3.  **Create and Activate Virtual Environment:**
+3.  **Create Virtual Environment:**
     ```bash
     uv venv
-    source .venv/bin/activate
     ```
 
 4.  **Install PyTorch (with CUDA support):**
@@ -91,7 +90,7 @@ We recommend using [uv](https://github.com/astral-sh/uv) for fast and reliable p
 
 1.  **Start the App:**
     ```bash
-    python main.py
+    uv run python main.py
     ```
 
 2.  **Load Data:**

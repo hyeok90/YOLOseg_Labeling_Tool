@@ -19,7 +19,6 @@ Thumbs.db
 # Large Model Files (Download separately)
 *.pt
 *.pth
-*.onnx
 
 # Project Specific - Temporary & Data
 .temp_labels/
