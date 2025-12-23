@@ -53,7 +53,9 @@ class MainWindow(QMainWindow):
         
         if os.path.exists(Config.SAM_ENCODER_PATH) and os.path.exists(Config.SAM_DECODER_PATH):
             try:
-                self.sam_predictor = SAMPredictor(Config.SAM_ENCODER_PATH, Config.SAM_DECODER_PATH)
+                device = 'cuda' if torch.cuda.is_available() else 'cpu'
+                print(f"Initializing SAM on device: {device}")
+                self.sam_predictor = SAMPredictor(Config.SAM_ENCODER_PATH, Config.SAM_DECODER_PATH, device=device)
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to load SAM model: {e}")
         else:

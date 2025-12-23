@@ -31,6 +31,10 @@ class SegmentAnythingONNX:
         self.device = device
         self.encoder = onnxruntime.InferenceSession(encoder_path, providers=['CPUExecutionProvider' if self.device == 'cpu' else 'CUDAExecutionProvider'])
         self.decoder = onnxruntime.InferenceSession(decoder_path, providers=['CPUExecutionProvider' if self.device == 'cpu' else 'CUDAExecutionProvider'])
+        
+        print(f"SAM Encoder active providers: {self.encoder.get_providers()}")
+        print(f"SAM Decoder active providers: {self.decoder.get_providers()}")
+        
         self.input_size = 1024
 
     def encode(self, image: np.ndarray):
