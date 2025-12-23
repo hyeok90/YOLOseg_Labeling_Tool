@@ -54,8 +54,8 @@ We recommend using [uv](https://github.com/astral-sh/uv) for fast and reliable p
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/hyeok90/segmentation_labeling_tool
-    cd segmentation_labeling_tool
+    git clone https://github.com/hyeok90/YOLOseg_Labeling_Tool
+    cd YOLOseg_Labeling_Tool
     ```
 
 2.  **Install uv (if not already installed):**
